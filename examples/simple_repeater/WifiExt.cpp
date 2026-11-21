@@ -13,7 +13,7 @@ extern MyMesh the_mesh;
 #ifndef WIFI_EXT_CFG_FILE
   #define WIFI_EXT_CFG_FILE "/wifiext.cfg"
 #endif
-#define WIFI_EXT_VERSION       "1.0.0"
+#define WIFI_EXT_VERSION       "1.0.1"
 #define TCP_LINE_MAX           160
 #define TCP_REPLY_MAX          512
 #define TCP_IDLE_TIMEOUT_MS    (15UL * 60UL * 1000UL)
@@ -180,6 +180,7 @@ static int tcp_line_len = 0;
 static uint8_t tcp_iac_skip = 0;
 static unsigned long tcp_lock_until = 0;
 static unsigned long mqtt_backoff = MQTT_RETRY_MS;
+static int mqtt_last_rc = 0;   // 0 = no error yet
 
 static WiFiClient mqtt_net;
 static PubSubClient mqtt(mqtt_net);
@@ -550,10 +551,13 @@ static void mqttLoop() {
                            cfg.mqtt_user[0] ? cfg.mqtt_pwd : NULL,
                            avail, 0, true, "offline");
     if (!ok) {
-      Serial.printf("MQTT: Verbindung zu %s:%u fehlgeschlagen (rc=%d)\n", cfg.mqtt_host, cfg.mqtt_port, mqtt.state());
+      mqtt_last_rc = mqtt.state();
+      if (mqtt_last_rc == 0) mqtt_last_rc = -2;
+      Serial.printf("MQTT: Verbindung zu %s:%u fehlgeschlagen (rc=%d)\n", cfg.mqtt_host, cfg.mqtt_port, mqtt_last_rc);
       return;
     }
     Serial.println("MQTT: verbunden");
+    mqtt_last_rc = 0;
     mqtt_backoff = MQTT_RETRY_MS;
     mqtt.publish(avail, "online", true);
     char cmd[96];
@@ -571,14 +575,40 @@ static void mqttLoop() {
 }
 
 // -------------------------------------------------------------- CLI hook --
+static const char* mqttReason(int rc) {
+  switch (rc) {
+    case -4: return "Timeout";
+    case -3: return "Verbindung verloren";
+    case -2: return "Broker nicht erreichbar";
+    case -1: return "getrennt";
+    case 1:  return "Protokoll abgelehnt";
+    case 2:  return "Client-ID abgelehnt";
+    case 3:  return "Broker nicht verfuegbar";
+    case 4:  return "Login falsch";
+    case 5:  return "nicht autorisiert";
+    default: return "unbekannt";
+  }
+}
+
+static void mqttStatus(char* out, size_t sz) {
+  if (!cfg.mqtt_en) { snprintf(out, sz, "aus"); return; }
+  if (cfg.mqtt_host[0] == 0) { snprintf(out, sz, "kein Host"); return; }
+  if (mqtt.connected()) { snprintf(out, sz, "verbunden"); return; }
+  if (mqtt_last_rc == 0) { snprintf(out, sz, "verbinde..."); return; }
+  long wait = next_mqtt_retry ? (long)(next_mqtt_retry - millis()) / 1000 : 0;
+  if (wait < 0) wait = 0;
+  snprintf(out, sz, "Fehler %d %s, neu in %lds", mqtt_last_rc, mqttReason(mqtt_last_rc), wait);
+}
+
 static void statusReply(char* reply) {
   if (!cfg.wifi_en) { strcpy(reply, "WiFi: aus"); return; }
   if (WiFi.status() == WL_CONNECTED) {
-    sprintf(reply, "WiFi: %s %s %ddBm | TCP:%s | MQTT:%s | OTA:%s",
+    char ms[64];
+    mqttStatus(ms, sizeof(ms));
+    snprintf(reply, 160, "WiFi: %s %s %ddBm | TCP:%s | MQTT:%s | OTA:%s",
       cfg.ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
       tcp_server ? (tcp_client && tcp_client.connected() ? "Sitzung" : "an") : "aus",
-      !cfg.mqtt_en ? "aus" : (mqtt.connected() ? "verbunden" : "getrennt"),
-      ota_running ? "an" : "aus");
+      ms, ota_running ? "an" : "aus");
   } else {
     sprintf(reply, "WiFi: verbinde mit '%s' (Status %d)", cfg.ssid, (int)WiFi.status());
   }
@@ -654,6 +684,7 @@ bool wifi_ext_handle_command(uint32_t sender_timestamp, const char* command, cha
     if (mqtt.connected()) mqtt.disconnect();
     next_mqtt_retry = 0;
     mqtt_backoff = MQTT_RETRY_MS;
+    mqtt_last_rc = 0;
     mqtt_discovery_sent = false;
     strcpy(reply, "OK");
   }

@@ -39,7 +39,7 @@ wifi
 
 | Befehl | Bedeutung | Standard |
 |---|---|---|
-| `wifi` / `wifi.status` | Status: SSID, IP, Signal, TCP/MQTT/OTA | |
+| `wifi` / `wifi.status` | Status: SSID, IP, Signal, TCP/MQTT/OTA – bei MQTT-Fehlern mit Grund (z. B. „Fehler 5 nicht autorisiert“) | |
 | `wifi.config` | alle Einstellungen (ohne Passwörter) | |
 | `wifi.reconnect` | WLAN neu verbinden | |
 | `mqtt.publish` | Discovery + Status sofort senden | |
@@ -99,3 +99,17 @@ Update: die normale `.bin` per OTA oder USB.
 Geänderte Dateien gegenüber Upstream: `examples/simple_repeater/WifiExt.{h,cpp}` (neu),
 kleine Hooks in `MyMesh.{h,cpp}`, `main.cpp`, `UITask.cpp` (IP-Zeile im Display) und das
 Build-Ziel in `variants/heltec_v4/platformio.ini`. Alles hinter `#ifdef WITH_WIFI_EXT`.
+
+## Update per OTA (ArduinoOTA)
+
+```
+python3 ~/.platformio/packages/framework-arduinoespressif32/tools/espota.py \
+  -i <ip-des-repeaters> -p 3232 -a '<admin-passwort>' -f heltec_v4_repeater_wifi-<version>.bin
+```
+
+oder aus dem Repo: `pio run -e heltec_v4_repeater_wifi -t upload --upload-port <ip> --upload-flags --auth=<admin-passwort>`
+
+## Changelog
+
+* **1.0.1** – `wifi` zeigt bei MQTT-Problemen Fehlercode, Grund und nächsten Versuch
+* **1.0.0** – erste Version
