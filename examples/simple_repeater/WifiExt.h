@@ -22,6 +22,9 @@ void wifi_ext_loop();
 // Handles wifi./tcp./mqtt./ota. CLI commands. Returns true if handled.
 bool wifi_ext_handle_command(uint32_t sender_timestamp, const char* command, char* reply);
 
+// called when a zero-hop repeater neighbour is heard (name may be NULL)
+void wifi_ext_on_neighbour(const uint8_t* pub_key, const char* name, float snr);
+
 // true while WiFi is enabled (prevents the repeater from light-sleeping)
 bool wifi_ext_is_active();
 

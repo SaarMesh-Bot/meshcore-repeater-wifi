@@ -236,6 +236,14 @@ public:
   void fillStats(RepeaterStats& stats);
   int getNeighbourCount() const;
   uint32_t getTxAirMillis() const { return getTotalAirTime(); }
+  uint32_t getRxAirMillis() const { return getReceiveAirTime(); }
+#if MAX_NEIGHBOURS
+  const NeighbourInfo* getNeighbourAt(int i) const { return (i >= 0 && i < MAX_NEIGHBOURS) ? &neighbours[i] : NULL; }
+  int getMaxNeighbours() const { return MAX_NEIGHBOURS; }
+#else
+  const NeighbourInfo* getNeighbourAt(int i) const { return NULL; }
+  int getMaxNeighbours() const { return 0; }
+#endif
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {

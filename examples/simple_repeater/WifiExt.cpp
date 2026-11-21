@@ -7,13 +7,39 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
+#include <WiFiUdp.h>
+#include <errno.h>
+#include <lwip/sockets.h>
+
+// ESP32 Arduino 2.0.x: WiFiClient::connected() calls recv() with length 0, which never sets
+// errno, and then decides on a *stale* errno left behind by any other socket. A healthy
+// connection can thus be flagged as closed, after which write() silently drops all data.
+// This client checks the socket itself (MSG_PEEK) and keeps _connected in sync.
+class RobustClient : public WiFiClient {
+public:
+  RobustClient() : WiFiClient() { }
+  RobustClient(const WiFiClient& c) : WiFiClient(c) { }
+  uint8_t connected() override {
+    int f = fd();
+    if (f < 0) { _connected = false; return 0; }
+    uint8_t b;
+    errno = 0;
+    int r = recv(f, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r > 0) { _connected = true; return 1; }
+    if (r == 0) { _connected = false; return 0; }             // orderly shutdown by peer
+    if (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR) { _connected = true; return 1; }
+    _connected = false;
+    return 0;
+  }
+  operator bool() { return connected(); }
+};
 
 extern MyMesh the_mesh;
 
 #ifndef WIFI_EXT_CFG_FILE
   #define WIFI_EXT_CFG_FILE "/wifiext.cfg"
 #endif
-#define WIFI_EXT_VERSION       "1.0.1"
+#define WIFI_EXT_VERSION       "1.1.3"
 #define TCP_LINE_MAX           160
 #define TCP_REPLY_MAX          512
 #define TCP_IDLE_TIMEOUT_MS    (15UL * 60UL * 1000UL)
@@ -22,6 +48,14 @@ extern MyMesh the_mesh;
 #define MQTT_RETRY_MS          30000UL
 #define DUTY_SAMPLE_MS         60000UL
 #define DUTY_SLOTS             61          // 60 min window
+#define NB_KNOWN_FILE          "/nbknown"
+#define NB_KNOWN_MAX           64
+#define NB_EVENT_QUEUE         8
+#define NB_PUBLISH_MIN_MS      30000UL
+#define NTP_RESYNC_MS          (6UL * 3600UL * 1000UL)
+#define NTP_RETRY_MS           60000UL
+#define NTP_TIMEOUT_MS         3000UL
+#define MQTT_BUF_SIZE          2048
 
 // ------------------------------------------------------------------ config --
 struct WifiExtCfg {
@@ -41,6 +75,10 @@ struct WifiExtCfg {
   bool     mqtt_cmd;        // accept advert/reboot buttons from HA
   bool     mqtt_discovery;
   bool     ota_en;
+  bool     ntp_en;
+  char     ntp_server[49];
+  bool     nb_notify;       // MQTT event for newly heard neighbours
+  bool     wifi_ps;         // WiFi modem sleep (default off)
 };
 
 static WifiExtCfg cfg;
@@ -58,6 +96,10 @@ static void cfgDefaults() {
   cfg.mqtt_cmd = true;
   cfg.mqtt_discovery = true;
   cfg.ota_en = true;
+  cfg.ntp_en = true;
+  strcpy(cfg.ntp_server, "pool.ntp.org");
+  cfg.nb_notify = true;
+  cfg.wifi_ps = false;
 }
 
 static void copyStr(char* dst, size_t dst_sz, const char* src) {
@@ -80,6 +122,7 @@ static const CfgItem items[] = {
   { "wifi.ssid",      T_STR,  cfg.ssid,            sizeof(cfg.ssid), false },
   { "wifi.pwd",       T_STR,  cfg.pwd,             sizeof(cfg.pwd), true },
   { "wifi.hostname",  T_STR,  cfg.hostname,        sizeof(cfg.hostname), false },
+  { "wifi.powersave", T_BOOL, &cfg.wifi_ps,        0, false },
   { "tcp.enabled",    T_BOOL, &cfg.tcp_en,         0, false },
   { "tcp.port",       T_U16,  &cfg.tcp_port,       0, false },
   { "mqtt.enabled",   T_BOOL, &cfg.mqtt_en,        0, false },
@@ -92,6 +135,9 @@ static const CfgItem items[] = {
   { "mqtt.cmd",       T_BOOL, &cfg.mqtt_cmd,       0, false },
   { "mqtt.discovery", T_BOOL, &cfg.mqtt_discovery, 0, false },
   { "ota.enabled",    T_BOOL, &cfg.ota_en,         0, false },
+  { "ntp.enabled",    T_BOOL, &cfg.ntp_en,         0, false },
+  { "ntp.server",     T_STR,  cfg.ntp_server,      sizeof(cfg.ntp_server), false },
+  { "mqtt.nbnotify",  T_BOOL, &cfg.nb_notify,      0, false },
 };
 #define NUM_ITEMS (sizeof(items) / sizeof(items[0]))
 
@@ -171,7 +217,7 @@ static unsigned long next_wifi_retry = 0;
 static char status_line[32] = "WiFi aus";
 
 static WiFiServer* tcp_server = NULL;
-static WiFiClient tcp_client;
+static RobustClient tcp_client;
 static bool tcp_authed = false;
 static uint8_t tcp_auth_fails = 0;
 static unsigned long tcp_last_activity = 0;
@@ -182,7 +228,7 @@ static unsigned long tcp_lock_until = 0;
 static unsigned long mqtt_backoff = MQTT_RETRY_MS;
 static int mqtt_last_rc = 0;   // 0 = no error yet
 
-static WiFiClient mqtt_net;
+static RobustClient mqtt_net;
 static PubSubClient mqtt(mqtt_net);
 static unsigned long next_mqtt_retry = 0;
 static unsigned long next_mqtt_publish = 0;
@@ -191,10 +237,37 @@ static unsigned long reboot_at = 0;
 
 static unsigned long duty_ms[DUTY_SLOTS];
 static unsigned long duty_air[DUTY_SLOTS];
+static unsigned long duty_rx[DUTY_SLOTS];
+static unsigned long duty_pkts[DUTY_SLOTS];
 static int duty_count = 0, duty_head = 0;
 static unsigned long next_duty_sample = 0;
 
 static bool ota_running = false;
+
+// diagnostics
+static volatile uint32_t diag_wifi_disc = 0;
+static volatile uint8_t  diag_wifi_reason = 0;
+static uint32_t diag_mqtt_conn = 0;
+static unsigned long diag_loop_max = 0;      // longest gap between wifi_ext_loop calls (ms), per publish interval
+static unsigned long diag_last_loop = 0;
+
+// NTP
+static WiFiUDP ntp_udp;
+static unsigned long next_ntp_at = 0;
+static unsigned long ntp_sent_at = 0;
+static bool ntp_waiting = false;
+static bool ntp_ok = false;
+static uint32_t ntp_last_sync = 0;   // epoch of last successful sync
+
+// neighbours
+struct KnownNb { uint8_t pfx[4]; char name[32]; };
+static KnownNb known[NB_KNOWN_MAX];
+static int known_n = 0;
+struct NbEvent { uint8_t pfx[4]; char name[32]; float snr; };
+static NbEvent nb_events[NB_EVENT_QUEUE];
+static int nb_events_n = 0;
+static bool nb_dirty = true;
+static unsigned long nb_last_publish = 0;
 
 // ------------------------------------------------------------------- WiFi --
 static void stopNetServices() {
@@ -227,6 +300,9 @@ static void wifiStart() {
   WiFi.setHostname(hn);
   WiFi.setAutoReconnect(true);
   WiFi.begin(cfg.ssid, cfg.pwd);
+  // mains-powered repeater: no modem sleep (avoids 0.3-4 s latency spikes on weak links)
+  if (!cfg.wifi_ps) WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   wifi_started = true;
   next_wifi_retry = millis() + WIFI_RETRY_MS;
   strcpy(status_line, "WiFi verbinde...");
@@ -307,7 +383,7 @@ static void tcpLoop() {
       incoming.print("Belegt - es ist bereits eine Sitzung aktiv.\r\n");
       incoming.stop();
     } else {
-      tcp_client = incoming;
+      tcp_client = RobustClient(incoming);
       tcp_authed = false;
       tcp_auth_fails = 0;
       tcp_line_len = 0;
@@ -369,6 +445,8 @@ static const SensorDef sensors_def[] = {
   { "last_rssi",   "Letzter RSSI",              "dBm", "signal_strength", "measurement",      false, NULL, 0 },
   { "last_snr",    "Letzter SNR",               "dB",  NULL,              "measurement",      false, "mdi:signal-variant", 2 },
   { "duty_1h",     "Sendeanteil (1 h)",         "%",   NULL,              "measurement",      false, "mdi:radio-tower", 2 },
+  { "rx_util_1h",  "Empfangsanteil (1 h)",      "%",   NULL,              "measurement",      false, "mdi:download-network", 2 },
+  { "recv_rate",   "Empfangsrate",              "msg/min", NULL,          "measurement",      false, "mdi:inbox-arrow-down", 1 },
   { "neighbours",  "Nachbarn",                  NULL,  NULL,              "measurement",      false, "mdi:access-point-network", -1 },
   { "tx_queue",    "Sendewarteschlange",        NULL,  NULL,              "measurement",      false, "mdi:tray-full", -1 },
   { "pkt_recv",    "Pakete empfangen",          NULL,  NULL,              "total_increasing", false, "mdi:download", -1 },
@@ -386,6 +464,10 @@ static const SensorDef sensors_def[] = {
   { "mcu_temp",    "MCU-Temperatur",            "°C",  "temperature",     "measurement",      true,  NULL, 1 },
   { "wifi_rssi",   "WLAN-Signal",               "dBm", "signal_strength", "measurement",      true,  NULL, 0 },
   { "heap_free",   "Freier Heap",               "B",   "data_size",       "measurement",      true,  NULL, 0 },
+  { "loop_max_ms", "Laengste Schleife",         "ms",  "duration",        "measurement",      true,  "mdi:timer-alert-outline", 0 },
+  { "wifi_disc",   "WLAN-Abbrueche",            NULL,  NULL,              "total_increasing", true,  "mdi:wifi-off", -1 },
+  { "wifi_reason", "WLAN-Abbruchgrund",         NULL,  NULL,              NULL,               true,  "mdi:wifi-alert", -1 },
+  { "mqtt_conn",   "MQTT-Verbindungen",         NULL,  NULL,              "total_increasing", true,  "mdi:lan-connect", -1 },
   { "err_flags",   "Fehlerflags",               NULL,  NULL,              NULL,               true,  "mdi:alert", -1 },
   { "ip",          "IP-Adresse",                NULL,  NULL,              NULL,               true,  "mdi:ip-network", -1 },
   { "firmware",    "Firmware",                  NULL,  NULL,              NULL,               true,  "mdi:chip", -1 },
@@ -425,8 +507,28 @@ static void publishDiscovery() {
     if (s.diagnostic)  n += snprintf(payload + n, sizeof(payload) - n, ",\"ent_cat\":\"diagnostic\"");
     if (s.icon)        n += snprintf(payload + n, sizeof(payload) - n, ",\"ic\":\"%s\"", s.icon);
     if (s.precision >= 0) n += snprintf(payload + n, sizeof(payload) - n, ",\"sug_dsp_prc\":%d", s.precision);
+    if (strcmp(s.key, "neighbours") == 0) {
+      char nbt[96];
+      topic(nbt, sizeof(nbt), "neighbours");
+      n += snprintf(payload + n, sizeof(payload) - n, ",\"json_attr_t\":\"%s\"", nbt);
+    }
     snprintf(payload + n, sizeof(payload) - n, "}");
     mqtt.publish(t, payload, true);
+  }
+
+  {
+    char evt[96];
+    topic(evt, sizeof(evt), "event");
+    snprintf(t, sizeof(t), "homeassistant/event/meshcore_%s/new_neighbour/config", node_id);
+    if (!cfg.nb_notify) {
+      mqtt.publish(t, "", true);
+    } else {
+      snprintf(payload, sizeof(payload),
+        "{\"name\":\"Neuer Nachbar\",\"uniq_id\":\"meshcore_%s_new_neighbour\",\"stat_t\":\"%s\","
+        "\"evt_typ\":[\"neuer_nachbar\"],\"avty_t\":\"%s\",\"ic\":\"mdi:radio-tower\",%s}",
+        node_id, evt, avail, dev);
+      mqtt.publish(t, payload, true);
+    }
   }
 
   char cmd[96];
@@ -446,21 +548,212 @@ static void publishDiscovery() {
   mqtt_discovery_sent = true;
 }
 
-static float dutyLastHour() {
-  if (duty_count < 2) return 0.0f;
+// rates over the sample window (max. 60 min): TX/RX airtime in %, received packets per minute
+struct Rates { float tx_pct, rx_pct, recv_per_min; };
+
+static Rates ratesLastHour() {
+  Rates r = { 0.0f, 0.0f, 0.0f };
+  if (duty_count < 2) return r;
   int newest = (duty_head - 1 + DUTY_SLOTS) % DUTY_SLOTS;
   int oldest = (duty_head - duty_count + DUTY_SLOTS) % DUTY_SLOTS;
   unsigned long dt = duty_ms[newest] - duty_ms[oldest];
-  if (dt == 0) return 0.0f;
-  unsigned long dair = duty_air[newest] - duty_air[oldest];
-  return 100.0f * (float)dair / (float)dt;
+  if (dt == 0) return r;
+  r.tx_pct = 100.0f * (float)(duty_air[newest] - duty_air[oldest]) / (float)dt;
+  r.rx_pct = 100.0f * (float)(duty_rx[newest] - duty_rx[oldest]) / (float)dt;
+  r.recv_per_min = (float)(duty_pkts[newest] - duty_pkts[oldest]) * 60000.0f / (float)dt;
+  return r;
 }
 
 static void sampleDuty() {
+  RepeaterStats st;
+  the_mesh.fillStats(st);
   duty_ms[duty_head] = millis();
   duty_air[duty_head] = the_mesh.getTxAirMillis();
+  duty_rx[duty_head] = the_mesh.getRxAirMillis();
+  duty_pkts[duty_head] = st.n_packets_recv;
   duty_head = (duty_head + 1) % DUTY_SLOTS;
   if (duty_count < DUTY_SLOTS) duty_count++;
+}
+
+// ------------------------------------------------------------- neighbours --
+static void pfxHex(char* out, const uint8_t* pfx) {
+  sprintf(out, "%02x%02x%02x%02x", pfx[0], pfx[1], pfx[2], pfx[3]);
+}
+
+static void knownLoad() {
+  known_n = 0;
+  if (!_fs || !_fs->exists(NB_KNOWN_FILE)) return;
+  File f = _fs->open(NB_KNOWN_FILE, "r");
+  if (!f) return;
+  while (f.available() && known_n < NB_KNOWN_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() < 8) continue;
+    KnownNb& k = known[known_n];
+    if (!mesh::Utils::fromHex(k.pfx, 4, line.substring(0, 8).c_str())) continue;
+    copyStr(k.name, sizeof(k.name), line.length() > 9 ? line.substring(9).c_str() : "");
+    known_n++;
+  }
+  f.close();
+}
+
+static void knownSave() {
+  if (!_fs) return;
+  File f = _fs->open(NB_KNOWN_FILE, "w");
+  if (!f) return;
+  char hex[9];
+  for (int i = 0; i < known_n; i++) {
+    pfxHex(hex, known[i].pfx);
+    f.print(hex); f.print(';'); f.print(known[i].name); f.print('\n');
+  }
+  f.close();
+}
+
+static KnownNb* knownFind(const uint8_t* pfx) {
+  for (int i = 0; i < known_n; i++) {
+    if (memcmp(known[i].pfx, pfx, 4) == 0) return &known[i];
+  }
+  return NULL;
+}
+
+void wifi_ext_on_neighbour(const uint8_t* pub_key, const char* name, float snr) {
+  nb_dirty = true;
+  char clean[32] = "";
+  if (name) {   // keep names JSON/CSV-safe
+    int j = 0;
+    for (int i = 0; name[i] && j < (int)sizeof(clean) - 1; i++) {
+      char c = name[i];
+      if (c == '"' || c == '\\' || c == ';' || (uint8_t)c < 0x20) continue;
+      clean[j++] = c;
+    }
+    clean[j] = 0;
+  }
+  KnownNb* k = knownFind(pub_key);
+  if (k) {
+    if (clean[0] && strcmp(k->name, clean) != 0) { copyStr(k->name, sizeof(k->name), clean); knownSave(); }
+    return;
+  }
+  // newly heard neighbour: remember permanently and queue an event
+  if (known_n >= NB_KNOWN_MAX) {   // drop the oldest entry
+    memmove(&known[0], &known[1], sizeof(KnownNb) * (NB_KNOWN_MAX - 1));
+    known_n = NB_KNOWN_MAX - 1;
+  }
+  k = &known[known_n++];
+  memcpy(k->pfx, pub_key, 4);
+  copyStr(k->name, sizeof(k->name), clean);
+  knownSave();
+  if (nb_events_n < NB_EVENT_QUEUE) {
+    NbEvent& e = nb_events[nb_events_n++];
+    memcpy(e.pfx, pub_key, 4);
+    copyStr(e.name, sizeof(e.name), clean);
+    e.snr = snr;
+  }
+  char hex[9];
+  pfxHex(hex, pub_key);
+  Serial.printf("Neuer Nachbar: %s %s (SNR %.1f)\n", hex, clean, snr);
+}
+
+static void publishNeighbours() {
+  static char payload[1800];
+  // collect valid entries, newest first
+  int idx[MAX_NEIGHBOURS > 0 ? MAX_NEIGHBOURS : 1];
+  int n = 0;
+  for (int i = 0; i < the_mesh.getMaxNeighbours(); i++) {
+    const NeighbourInfo* nb = the_mesh.getNeighbourAt(i);
+    if (nb && nb->heard_timestamp > 0) idx[n++] = i;
+  }
+  for (int a = 1; a < n; a++) {   // insertion sort by heard_timestamp desc
+    int v = idx[a], b = a - 1;
+    while (b >= 0 && the_mesh.getNeighbourAt(idx[b])->heard_timestamp < the_mesh.getNeighbourAt(v)->heard_timestamp) {
+      idx[b + 1] = idx[b]; b--;
+    }
+    idx[b + 1] = v;
+  }
+  uint32_t now = rtc_clock.getCurrentTime();
+  int len = snprintf(payload, sizeof(payload), "{\"count\":%d,\"neighbours\":[", n);
+  char summary[600] = "";
+  int slen = 0;
+  for (int j = 0; j < n && j < 16; j++) {
+    const NeighbourInfo* nb = the_mesh.getNeighbourAt(idx[j]);
+    char hex[9];
+    pfxHex(hex, nb->id.pub_key);
+    KnownNb* k = knownFind(nb->id.pub_key);
+    const char* nm = (k && k->name[0]) ? k->name : hex;
+    long ago = (long)now - (long)nb->heard_timestamp;
+    if (ago < 0) ago = 0;
+    float snr = nb->snr / 4.0f;
+    int w = snprintf(payload + len, sizeof(payload) - len,
+      "%s{\"id\":\"%s\",\"name\":\"%s\",\"snr\":%.2f,\"heard_ago_s\":%ld}", j ? "," : "", hex, nm, snr, ago);
+    if (w < 0 || len + w >= (int)sizeof(payload) - 200) break;
+    len += w;
+    char agos[16];
+    if (ago < 3600) snprintf(agos, sizeof(agos), "%ld min", ago / 60);
+    else if (ago < 172800) snprintf(agos, sizeof(agos), "%ld h", ago / 3600);
+    else snprintf(agos, sizeof(agos), "%ld d", ago / 86400);
+    int sw = snprintf(summary + slen, sizeof(summary) - slen, "%s%s (%.1f dB, vor %s)", j ? "; " : "", nm, snr, agos);
+    if (sw > 0 && slen + sw < (int)sizeof(summary)) slen += sw;
+  }
+  snprintf(payload + len, sizeof(payload) - len, "],\"summary\":\"%s\"}", summary);
+  char t[96];
+  topic(t, sizeof(t), "neighbours");
+  mqtt.publish(t, payload, true);
+  nb_dirty = false;
+  nb_last_publish = millis();
+}
+
+static void publishNbEvents() {
+  char t[96], payload[200], hex[9];
+  topic(t, sizeof(t), "event");
+  for (int i = 0; i < nb_events_n; i++) {
+    pfxHex(hex, nb_events[i].pfx);
+    snprintf(payload, sizeof(payload),
+      "{\"event_type\":\"neuer_nachbar\",\"id\":\"%s\",\"name\":\"%s\",\"snr\":%.2f}",
+      hex, nb_events[i].name[0] ? nb_events[i].name : hex, nb_events[i].snr);
+    mqtt.publish(t, payload, false);
+  }
+  nb_events_n = 0;
+}
+
+// -------------------------------------------------------------------- NTP --
+static void ntpLoop() {
+  if (!cfg.ntp_en || cfg.ntp_server[0] == 0) return;
+  if (!ntp_waiting) {
+    if (next_ntp_at && (long)(millis() - next_ntp_at) < 0) return;
+    IPAddress ip;
+    if (!WiFi.hostByName(cfg.ntp_server, ip)) { next_ntp_at = millis() + NTP_RETRY_MS; return; }
+    uint8_t pkt[48] = { 0 };
+    pkt[0] = 0x1B;   // LI 0, version 3, client mode
+    ntp_udp.begin(0);
+    ntp_udp.beginPacket(ip, 123);
+    ntp_udp.write(pkt, sizeof(pkt));
+    ntp_udp.endPacket();
+    ntp_sent_at = millis();
+    ntp_waiting = true;
+    return;
+  }
+  if (ntp_udp.parsePacket() >= 48) {
+    uint8_t buf[48];
+    ntp_udp.read(buf, sizeof(buf));
+    ntp_udp.stop();
+    ntp_waiting = false;
+    uint32_t secs1900 = ((uint32_t)buf[40] << 24) | ((uint32_t)buf[41] << 16) | ((uint32_t)buf[42] << 8) | buf[43];
+    uint32_t epoch = secs1900 - 2208988800UL;
+    if (epoch < 1700000000UL) { next_ntp_at = millis() + NTP_RETRY_MS; return; }
+    uint32_t curr = rtc_clock.getCurrentTime();
+    if (epoch > curr + 1) {
+      rtc_clock.setCurrentTime(epoch);
+      Serial.printf("NTP: Uhr gestellt (+%lu s)\n", (unsigned long)(epoch - curr));
+    } else if (curr > epoch + 60) {
+      Serial.printf("NTP: Uhr geht %lu s vor - wird nicht zurueckgestellt\n", (unsigned long)(curr - epoch));
+    }
+    ntp_ok = true;
+    ntp_last_sync = epoch;
+    next_ntp_at = millis() + NTP_RESYNC_MS;
+  } else if ((long)(millis() - ntp_sent_at) > (long)NTP_TIMEOUT_MS) {
+    ntp_udp.stop();
+    ntp_waiting = false;
+    next_ntp_at = millis() + NTP_RETRY_MS;
+  }
 }
 
 static void escapeJson(char* out, size_t sz, const char* in) {
@@ -489,15 +782,18 @@ static void publishState() {
   char name[64];
   escapeJson(name, sizeof(name), the_mesh.getNodeName());
 
-  char payload[900];
+  Rates rt = ratesLastHour();
+  char payload[1200];
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"%s\",\"batt_mv\":%u,\"batt_v\":%.3f,\"batt_pct\":%d,\"noise_floor\":%d,\"last_rssi\":%d,"
+    "{\"loop_max_ms\":%lu,\"wifi_disc\":%lu,\"wifi_reason\":%u,\"mqtt_conn\":%lu,"
+    "\"rx_util_1h\":%.3f,\"recv_rate\":%.2f,\"ntp_ok\":%s,\"name\":\"%s\",\"batt_mv\":%u,\"batt_v\":%.3f,\"batt_pct\":%d,\"noise_floor\":%d,\"last_rssi\":%d,"
     "\"last_snr\":%.2f,\"duty_1h\":%.3f,\"neighbours\":%d,\"tx_queue\":%u,\"pkt_recv\":%lu,\"pkt_sent\":%lu,"
     "\"recv_flood\":%lu,\"recv_direct\":%lu,\"sent_flood\":%lu,\"sent_direct\":%lu,\"flood_dups\":%u,"
     "\"direct_dups\":%u,\"recv_errors\":%lu,\"air_tx\":%lu,\"air_rx\":%lu,\"uptime\":%lu,\"mcu_temp\":%s,"
     "\"wifi_rssi\":%d,\"heap_free\":%u,\"err_flags\":%u,\"ip\":\"%s\",\"firmware\":\"%s\"}",
-    name, st.batt_milli_volts, v, pct, st.noise_floor, st.last_rssi,
-    st.last_snr / 4.0f, dutyLastHour(), the_mesh.getNeighbourCount(), st.curr_tx_queue_len,
+    diag_loop_max, (unsigned long)diag_wifi_disc, (unsigned)diag_wifi_reason, (unsigned long)diag_mqtt_conn,
+    rt.rx_pct, rt.recv_per_min, ntp_ok ? "true" : "false", name, st.batt_milli_volts, v, pct, st.noise_floor, st.last_rssi,
+    st.last_snr / 4.0f, rt.tx_pct, the_mesh.getNeighbourCount(), st.curr_tx_queue_len,
     (unsigned long)st.n_packets_recv, (unsigned long)st.n_packets_sent,
     (unsigned long)st.n_recv_flood, (unsigned long)st.n_recv_direct,
     (unsigned long)st.n_sent_flood, (unsigned long)st.n_sent_direct, st.n_flood_dups,
@@ -509,6 +805,7 @@ static void publishState() {
   char t[96];
   topic(t, sizeof(t), "state");
   mqtt.publish(t, payload, true);
+  diag_loop_max = 0;
 }
 
 static void mqttCallback(char* tp, byte* data, unsigned int len) {
@@ -539,9 +836,9 @@ static void mqttLoop() {
     next_mqtt_retry = millis() + mqtt_backoff;
     if (mqtt_backoff < 300000UL) mqtt_backoff *= 2;   // 30 s .. 5 min while broker is down
     mqtt.setServer(cfg.mqtt_host, cfg.mqtt_port);
-    mqtt.setBufferSize(1024);
+    mqtt.setBufferSize(MQTT_BUF_SIZE);
     mqtt.setKeepAlive(60);
-    mqtt.setSocketTimeout(3);
+    mqtt.setSocketTimeout(10);
     mqtt.setCallback(mqttCallback);
     char client_id[32], avail[96];
     snprintf(client_id, sizeof(client_id), "meshcore-%s", node_id);
@@ -557,6 +854,7 @@ static void mqttLoop() {
       return;
     }
     Serial.println("MQTT: verbunden");
+    diag_mqtt_conn++;
     mqtt_last_rc = 0;
     mqtt_backoff = MQTT_RETRY_MS;
     mqtt.publish(avail, "online", true);
@@ -564,6 +862,8 @@ static void mqttLoop() {
     topic(cmd, sizeof(cmd), "cmd");
     mqtt.subscribe(cmd);
     mqtt_discovery_sent = false;
+    nb_dirty = true;
+    nb_last_publish = millis() - NB_PUBLISH_MIN_MS;
     next_mqtt_publish = millis() + 3000;   // first state shortly after discovery
   }
   mqtt.loop();
@@ -571,7 +871,10 @@ static void mqttLoop() {
   if ((long)(millis() - next_mqtt_publish) >= 0) {
     next_mqtt_publish = millis() + (unsigned long)max((int)cfg.mqtt_interval, 10) * 1000UL;
     publishState();
+    nb_dirty = true;   // refresh "heard ago" with every state publish
   }
+  if (nb_dirty && (long)(millis() - nb_last_publish) >= (long)NB_PUBLISH_MIN_MS) publishNeighbours();
+  if (nb_events_n > 0 && cfg.nb_notify) publishNbEvents();
 }
 
 // -------------------------------------------------------------- CLI hook --
@@ -605,10 +908,10 @@ static void statusReply(char* reply) {
   if (WiFi.status() == WL_CONNECTED) {
     char ms[64];
     mqttStatus(ms, sizeof(ms));
-    snprintf(reply, 160, "WiFi: %s %s %ddBm | TCP:%s | MQTT:%s | OTA:%s",
+    snprintf(reply, 160, "WiFi: %s %s %ddBm | TCP:%s | MQTT:%s | OTA:%s | NTP:%s",
       cfg.ssid, WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(),
       tcp_server ? (tcp_client && tcp_client.connected() ? "Sitzung" : "an") : "aus",
-      ms, ota_running ? "an" : "aus");
+      ms, ota_running ? "an" : "aus", !cfg.ntp_en ? "aus" : (ntp_ok ? "ok" : "wartet"));
   } else {
     sprintf(reply, "WiFi: verbinde mit '%s' (Status %d)", cfg.ssid, (int)WiFi.status());
   }
@@ -631,6 +934,23 @@ bool wifi_ext_handle_command(uint32_t sender_timestamp, const char* command, cha
     strcpy(reply, "OK - Discovery + Status werden gesendet");
     return true;
   }
+  if (strcmp(command, "nb.known") == 0) {
+    int n = snprintf(reply, 160, "%d bekannt:", known_n);
+    char hex[9];
+    for (int i = known_n - 1; i >= 0 && n < 140; i--) {   // newest first
+      pfxHex(hex, known[i].pfx);
+      int w = snprintf(reply + n, 160 - n, " %s", known[i].name[0] ? known[i].name : hex);
+      if (w < 0 || n + w >= 159) break;
+      n += w;
+    }
+    return true;
+  }
+  if (strcmp(command, "nb.forget") == 0) {
+    known_n = 0;
+    knownSave();
+    strcpy(reply, "OK - Liste bekannter Nachbarn geloescht");
+    return true;
+  }
   if (strcmp(command, "wifi.config") == 0) {
     // compact overview without secrets (fits the LoRa reply size)
     int n = 0;
@@ -651,7 +971,7 @@ bool wifi_ext_handle_command(uint32_t sender_timestamp, const char* command, cha
   if (!is_set && !is_get) return false;
 
   const char* p = command + 4;
-  if (memcmp(p, "wifi.", 5) && memcmp(p, "tcp.", 4) && memcmp(p, "mqtt.", 5) && memcmp(p, "ota.", 4)) return false;
+  if (memcmp(p, "wifi.", 5) && memcmp(p, "tcp.", 4) && memcmp(p, "mqtt.", 5) && memcmp(p, "ota.", 4) && memcmp(p, "ntp.", 4)) return false;
 
   char key[24];
   int k = 0;
@@ -677,6 +997,9 @@ bool wifi_ext_handle_command(uint32_t sender_timestamp, const char* command, cha
   if (memcmp(key, "wifi.", 5) == 0) {
     if (strcmp(key, "wifi.enabled") == 0 || cfg.wifi_en) wifiStart();
     strcpy(reply, "OK - WiFi wird neu gestartet");
+  } else if (memcmp(key, "ntp.", 4) == 0) {
+    next_ntp_at = 0;   // sync again soon
+    strcpy(reply, "OK");
   } else if (memcmp(key, "tcp.", 4) == 0 || memcmp(key, "ota.", 4) == 0) {
     if (net_services_up) { stopNetServices(); }   // restarted by loop when connected
     strcpy(reply, "OK");
@@ -697,11 +1020,19 @@ void wifi_ext_begin(fs::FS* fs) {
   mesh::Utils::toHex(node_id, the_mesh.getSelfId().pub_key, 6);
   for (char* c = node_id; *c; c++) *c = tolower(*c);
   cfgLoad();
+  knownLoad();
+  WiFi.onEvent([](arduino_event_id_t ev, arduino_event_info_t info) {
+    diag_wifi_disc++;
+    diag_wifi_reason = info.wifi_sta_disconnected.reason;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   if (cfg.wifi_en && cfg.ssid[0]) wifiStart();
   else WiFi.mode(WIFI_OFF);
 }
 
 void wifi_ext_loop() {
+  unsigned long now_ms = millis();
+  if (diag_last_loop && now_ms - diag_last_loop > diag_loop_max) diag_loop_max = now_ms - diag_last_loop;
+  diag_last_loop = now_ms;
   if ((long)(millis() - next_duty_sample) >= 0) {
     next_duty_sample = millis() + DUTY_SAMPLE_MS;
     sampleDuty();
@@ -726,6 +1057,7 @@ void wifi_ext_loop() {
       Serial.printf("WiFi: verbunden, %s (%d dBm)\n", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
     }
     if (ota_running) ArduinoOTA.handle();
+    ntpLoop();
     tcpLoop();
     mqttLoop();
   } else {
@@ -739,6 +1071,7 @@ void wifi_ext_loop() {
       next_wifi_retry = millis() + WIFI_RETRY_MS;
       WiFi.disconnect();
       WiFi.begin(cfg.ssid, cfg.pwd);
+      if (!cfg.wifi_ps) WiFi.setSleep(false);
     }
   }
 }

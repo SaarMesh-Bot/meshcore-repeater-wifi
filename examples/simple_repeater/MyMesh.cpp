@@ -672,6 +672,9 @@ void MyMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, uint32
     AdvertDataParser parser(app_data, app_data_len);
     if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) { // just keep neigbouring Repeaters
       putNeighbour(id, timestamp, packet->getSNR());
+#ifdef WITH_WIFI_EXT
+      wifi_ext_on_neighbour(id.pub_key, parser.getName(), packet->getSNR());
+#endif
     }
   }
 }
@@ -856,6 +859,9 @@ void MyMesh::onControlDataRecv(mesh::Packet* packet) {
       return;
     }
     putNeighbour(id, rtc_clock.getCurrentTime(), packet->getSNR());
+#ifdef WITH_WIFI_EXT
+    wifi_ext_on_neighbour(id.pub_key, NULL, packet->getSNR());
+#endif
   }
 }
 

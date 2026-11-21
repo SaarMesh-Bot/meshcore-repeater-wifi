@@ -55,6 +55,11 @@ wifi
 | `set mqtt.cmd` | Buttons (Advert/Neustart) aus HA erlauben | on |
 | `set mqtt.discovery` | HA-Discovery senden | on |
 | `set ota.enabled` | ArduinoOTA | on |
+| `set ntp.enabled` / `set ntp.server` | Uhrzeit per NTP (nur vorwärts, alle 6 h) | on / `pool.ntp.org` |
+| `set wifi.powersave` | WLAN-Stromsparmodus (verursacht 0,3–4 s Latenz) | off |
+| `set mqtt.nbnotify` | HA-Event bei neuem Nachbarn | on |
+| `nb.known` | dauerhaft gemerkte Nachbarn | |
+| `nb.forget` | Liste gemerkter Nachbarn leeren (alle gelten wieder als neu) | |
 
 Passwörter werden bei `get` nie im Klartext ausgegeben.
 
@@ -77,6 +82,8 @@ Nur eine Sitzung gleichzeitig, 15 min Leerlauf-Timeout, nach 3 Fehlversuchen wir
 | `meshcore/<id>/state` | JSON mit allen Werten (retained) |
 | `meshcore/<id>/availability` | `online` / `offline` (LWT, retained) |
 | `meshcore/<id>/cmd` | `advert`, `flood_advert`, `reboot`, `publish` |
+| `meshcore/<id>/neighbours` | Nachbarliste (JSON, retained) – Attribute des Sensors „Nachbarn“ |
+| `meshcore/<id>/event` | `{"event_type":"neuer_nachbar","id","name","snr"}` – HA-Event-Entität „Neuer Nachbar“ |
 | `homeassistant/sensor/meshcore_<id>/…/config` | Discovery |
 
 `<id>` = erste 6 Byte des Public Keys (hex, klein).
@@ -85,7 +92,13 @@ Werte im JSON: `batt_mv, batt_v, batt_pct, noise_floor, last_rssi, last_snr, dut
 pkt_recv, pkt_sent, recv_flood, recv_direct, sent_flood, sent_direct, flood_dups, direct_dups, recv_errors,
 air_tx, air_rx, uptime, mcu_temp, wifi_rssi, heap_free, err_flags, ip, firmware`.
 
-`duty_1h` = Anteil der Sendezeit in den letzten 60 Minuten (%).
+`duty_1h` / `rx_util_1h` = Anteil Sende-/Empfangszeit in den letzten 60 Minuten (%), `recv_rate` = empfangene Pakete pro Minute (60-min-Mittel).
+Diagnose: `loop_max_ms`, `wifi_disc`, `wifi_reason`, `mqtt_conn`.
+
+**Neuer Nachbar:** Hört der Repeater zum ersten Mal einen Repeater direkt (Zero-Hop-Advert), wird er in `/nbknown`
+gespeichert und ein MQTT-Event gesendet – auch über Neustarts hinweg nur einmal pro Repeater.
+
+**Hinweis OTA:** Ein geändertes Admin-Passwort gilt für OTA erst nach dem nächsten Neustart (ArduinoOTA-Eigenheit).
 
 ## Bauen
 
@@ -110,6 +123,12 @@ python3 ~/.platformio/packages/framework-arduinoespressif32/tools/espota.py \
 oder aus dem Repo: `pio run -e heltec_v4_repeater_wifi -t upload --upload-port <ip> --upload-flags --auth=<admin-passwort>`
 
 ## Changelog
+
+* **1.1.3** – Fix: TCP-CLI antwortete nach dem Login nicht mehr und MQTT brach direkt nach dem Verbinden ab.
+  Ursache: `WiFiClient::connected()` (ESP32 Arduino 2.0.x) wertet ein veraltetes `errno` aus. Eigene Prüfung per `MSG_PEEK`.
+* **1.1.2** – Diagnosewerte (längste Schleife, WLAN-Abbrüche + Grund, MQTT-Verbindungen)
+* **1.1.1** – WLAN-Stromsparmodus standardmäßig aus, max. WLAN-Sendeleistung, MQTT-Timeout 10 s
+* **1.1.0** – NTP-Zeit, Nachbarliste in HA, Event „Neuer Nachbar“, Empfangsanteil/Empfangsrate
 
 * **1.0.1** – `wifi` zeigt bei MQTT-Problemen Fehlercode, Grund und nächsten Versuch
 * **1.0.0** – erste Version
