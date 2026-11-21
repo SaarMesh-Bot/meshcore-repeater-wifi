@@ -2,6 +2,9 @@
 #include "target.h"
 #include <Arduino.h>
 #include <helpers/CommonCLI.h>
+#ifdef WITH_WIFI_EXT
+#include "WifiExt.h"
+#endif
 
 #ifndef USER_BTN_PRESSED
 #define USER_BTN_PRESSED LOW
@@ -106,6 +109,10 @@ void UITask::renderCurrScreen() {
     _display->setCursor(0, 30);
     sprintf(tmp, "BW: %03.2f CR: %d", _node_prefs->bw, _node_prefs->cr);
     _display->print(tmp);
+#ifdef WITH_WIFI_EXT
+    _display->setCursor(0, 44);
+    _display->print(wifi_ext_status_line());
+#endif
   }
 }
 

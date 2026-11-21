@@ -208,13 +208,7 @@ uint8_t MyMesh::handleAnonClockReq(const mesh::Identity& sender, uint32_t sender
   return 0;
 }
 
-int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload, size_t payload_len) {
-  // uint32_t now = getRTCClock()->getCurrentTimeUnique();
-  // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
-  memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
-
-  if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
-    RepeaterStats stats;
+void MyMesh::fillStats(RepeaterStats& stats) {
     stats.batt_milli_volts = board.getBattMilliVolts();
     stats.curr_tx_queue_len = _mgr->getOutboundTotal();
     stats.noise_floor = (int16_t)_radio->getNoiseFloor();
@@ -233,6 +227,28 @@ int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t
     stats.n_flood_dups = ((SimpleMeshTables *)getTables())->getNumFloodDups();
     stats.total_rx_air_time_secs = getReceiveAirTime() / 1000;
     stats.n_recv_errors = radio_driver.getPacketsRecvErrors();
+}
+
+int MyMesh::getNeighbourCount() const {
+#if MAX_NEIGHBOURS
+  int n = 0;
+  for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+    if (neighbours[i].heard_timestamp > 0) n++;
+  }
+  return n;
+#else
+  return 0;
+#endif
+}
+
+int MyMesh::handleRequest(ClientInfo *sender, uint32_t sender_timestamp, uint8_t *payload, size_t payload_len) {
+  // uint32_t now = getRTCClock()->getCurrentTimeUnique();
+  // memcpy(reply_data, &now, 4);   // response packets always prefixed with timestamp
+  memcpy(reply_data, &sender_timestamp, 4); // reflect sender_timestamp back in response packet (kind of like a 'tag')
+
+  if (payload[0] == REQ_TYPE_GET_STATUS) {  // guests can also access this now
+    RepeaterStats stats;
+    fillStats(stats);
     memcpy(&reply_data[4], &stats, sizeof(stats));
 
     return 4 + sizeof(stats); //  reply_len
@@ -1238,6 +1254,10 @@ void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply
     command += 3;
   }
 
+#ifdef WITH_WIFI_EXT
+  if (wifi_ext_handle_command(sender_timestamp, command, reply)) return;
+#endif
+
   // handle ACL related commands
   if (memcmp(command, "setperm ", 8) == 0) {   // format:  setperm {pubkey-hex} {permissions-int8}
     char* hex = &command[8];
@@ -1333,6 +1353,9 @@ void MyMesh::loop() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
+#ifdef WITH_WIFI_EXT
+  if (wifi_ext_is_active()) return true;  // WiFi needs the CPU awake, can't light-sleep
+#endif
 #if defined(WITH_BRIDGE)
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif

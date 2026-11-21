@@ -106,6 +106,10 @@ void setup() {
 
   the_mesh.begin(fs);
 
+#ifdef WITH_WIFI_EXT
+  wifi_ext_begin(fs);
+#endif
+
 #ifdef DISPLAY_CLASS
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
 #endif
@@ -196,6 +200,9 @@ void loop() {
 #endif
 
   the_mesh.loop();
+#ifdef WITH_WIFI_EXT
+  wifi_ext_loop();
+#endif
   sensors.loop();
 #ifdef DISPLAY_CLASS
   ui_task.loop();

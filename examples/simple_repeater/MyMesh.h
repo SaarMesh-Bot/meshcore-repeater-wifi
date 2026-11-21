@@ -36,6 +36,9 @@
 #include <helpers/RegionMap.h>
 #include <helpers/RoutingPolicy.h>
 #include "RateLimiter.h"
+#ifdef WITH_WIFI_EXT
+#include "WifiExt.h"
+#endif
 
 #ifdef WITH_BRIDGE
 extern AbstractBridge* bridge;
@@ -228,6 +231,11 @@ public:
 
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
+
+  // SaarMesh: accessors for the WiFi/MQTT extension
+  void fillStats(RepeaterStats& stats);
+  int getNeighbourCount() const;
+  uint32_t getTxAirMillis() const { return getTotalAirTime(); }
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {
